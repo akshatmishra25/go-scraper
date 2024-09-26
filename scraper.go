@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"strings"
 	"sync"
+	"strings"
 	"time"
 	"unicode"
 
@@ -16,8 +16,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/mux"
 	_ "github.com/lib/pq"
-
-	//"github.com/go-chi/chi/middleware"
 	"golang.org/x/time/rate"
 )
 
@@ -36,7 +34,6 @@ type item struct {
 // Database connection (PostgreSQL)
 var db *sql.DB
 
-// Rate limiters per IP
 var visitors = make(map[string]*rate.Limiter)
 var mu sync.Mutex // Guards visitors map
 
@@ -48,18 +45,20 @@ func main() {
 	// Initialize DB
 	initDB()
 
-	// Scrape reports and store in the DB on a POST request
+	// Start the background scraping job
+	go startScrapingJob()
+
+	// Set up your HTTP router
 	router := mux.NewRouter()
 
 	router.Use(rateLimitMiddleware)
-	router.HandleFunc("/createReports", createReports).Methods("POST")
+
 	router.HandleFunc("/reports", getReports).Methods("GET")
 	router.HandleFunc("/reports/{id}", getReportByID).Methods("GET")
 
 	fmt.Println("Server started at :8080")
 	http.ListenAndServe(":8080", router)
 }
-
 
 func rateLimitMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -126,9 +125,20 @@ func initDB() {
 	}
 }
 
-// Web scraping handler that extracts reports and stores them in the DB
-func createReports(w http.ResponseWriter, r *http.Request) {
-	// Web scraping logic
+// Start the background job to run scraping every 5 minutes
+func startScrapingJob() {
+	for {
+		// Run scraping job
+		fmt.Println("Starting scraping job...")
+		createReports()
+
+		// Sleep for 5 minutes before the next job
+		time.Sleep(15 * time.Minute)
+	}
+}
+
+// Web scraping function that extracts reports and stores them in the DB
+func createReports() {
 	var reports []item
 	c := colly.NewCollector()
 
@@ -189,8 +199,7 @@ func createReports(w http.ResponseWriter, r *http.Request) {
 	// Visit the website for scraping
 	c.Visit("https://www.chainabuse.com/reports")
 
-	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(map[string]string{"message": "Reports successfully created"})
+	fmt.Println("Scraping job completed.")
 }
 
 // Fetch all reports from the DB
@@ -233,7 +242,6 @@ func getReportByID(w http.ResponseWriter, r *http.Request) {
 }
 
 // Utility functions to process time and name field
-
 func parseTime(relativeTime string) string {
 	currentDate := time.Now()
 	fields := strings.Fields(relativeTime)
