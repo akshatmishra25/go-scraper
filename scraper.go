@@ -1,22 +1,22 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
-	"sync"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
 
 	"github.com/PuerkitoBio/goquery"
-	"github.com/gocolly/colly"
+	"github.com/chromedp/chromedp"
 	"github.com/google/uuid"
 	"github.com/gorilla/mux"
 	_ "github.com/lib/pq"
-	"golang.org/x/time/rate"
 )
 
 // Define your struct
@@ -31,15 +31,7 @@ type item struct {
 	Date      string    `json:"date"`
 }
 
-// Database connection (PostgreSQL)
 var db *sql.DB
-
-var visitors = make(map[string]*rate.Limiter)
-var mu sync.Mutex // Guards visitors map
-
-// Rate limiter settings (5 requests per minute)
-const requestsPerMinute = 5
-const burstLimit = 5
 
 func main() {
 	// Initialize DB
@@ -51,54 +43,11 @@ func main() {
 	// Set up your HTTP router
 	router := mux.NewRouter()
 
-	router.Use(rateLimitMiddleware)
-
 	router.HandleFunc("/reports", getReports).Methods("GET")
 	router.HandleFunc("/reports/{id}", getReportByID).Methods("GET")
 
 	fmt.Println("Server started at :8080")
 	http.ListenAndServe(":8080", router)
-}
-
-func rateLimitMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ip := getIP(r)
-
-		limiter := getVisitorLimiter(ip)
-		if !limiter.Allow() {
-			http.Error(w, "Too many requests. Please try again later.", http.StatusTooManyRequests)
-			return
-		}
-
-		next.ServeHTTP(w, r)
-	})
-}
-
-// Get the rate limiter for a specific IP address
-func getVisitorLimiter(ip string) *rate.Limiter {
-	mu.Lock()
-	defer mu.Unlock()
-
-	limiter, exists := visitors[ip]
-	if !exists {
-		limiter = rate.NewLimiter(rate.Every(time.Minute/requestsPerMinute), burstLimit)
-		visitors[ip] = limiter
-	}
-
-	return limiter
-}
-
-// Get the IP address of the client
-func getIP(r *http.Request) string {
-	ip := r.Header.Get("X-Forwarded-For") // Get IP from reverse proxy or load balancer
-	if ip == "" {
-		ip = r.RemoteAddr // Fallback to direct IP
-	}
-	// Strip port number from RemoteAddr (IP:port format)
-	if idx := strings.LastIndex(ip, ":"); idx != -1 {
-		ip = ip[:idx]
-	}
-	return ip
 }
 
 func initDB() {
@@ -128,29 +77,66 @@ func initDB() {
 // Start the background job to run scraping every 5 minutes
 func startScrapingJob() {
 	for {
-		// Run scraping job
 		fmt.Println("Starting scraping job...")
 		createReports()
 
 		// Sleep for 5 minutes before the next job
-		time.Sleep(15 * time.Minute)
+		time.Sleep(60 * time.Minute)
 	}
 }
 
-// Web scraping function that extracts reports and stores them in the DB
 func createReports() {
+	totalReports, err := getTotalReports()
+	if err != nil {
+		log.Fatal(err)
+		return
+	}
+
+	totalPages := (totalReports / 15) + 1
+	fmt.Printf("Total reports: %d, Total pages: %d\n", totalReports, totalPages)
+
+	// Iterate over each page
+	for i := 0; i < totalPages; i++ {
+		pageURL := fmt.Sprintf("https://www.chainabuse.com/reports?page=%d", i)
+		fmt.Printf("Scraping page: %d\n", i+1)
+		scrapePage(pageURL)
+	}
+}
+
+func scrapePage(url string) {
+	ctx, cancel := chromedp.NewContext(context.Background())
+	defer cancel()
+
 	var reports []item
-	c := colly.NewCollector()
+	var htmlContent string
 
-	c.OnHTML(".create-ScamReportCard", func(e *colly.HTMLElement) {
-		Category := e.ChildText(".create-ScamReportCard__category-section p")
-		Name := e.ChildText(".create-ScamReportCard__preview-description-wrapper")
-		Address := e.ChildText(".create-ReportedSection__address-section .create-ResponsiveAddress__text")
-		Domain := e.ChildText(".create-ReportedSection__domain")
-		Timestamp := e.ChildText(".create-ScamReportCard__submitted-info > span:nth-child(3)")
+	// Navigate to the page and get the outer HTML
+	err := chromedp.Run(ctx,
+		chromedp.Navigate(url),
+		chromedp.WaitVisible(".create-ScamReportCard"),
+		chromedp.OuterHTML("html", &htmlContent),
+	)
 
+	if err != nil {
+		log.Fatalf("Error navigating to %s: %v", url, err)
+	}
+
+	// Parse the HTML with goquery to extract the reports
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader(htmlContent))
+	if err != nil {
+		log.Fatalf("Error loading HTML document: %v", err)
+	}
+
+	doc.Find(".create-ScamReportCard").Each(func(i int, e *goquery.Selection) {
+		Category := e.Find(".create-ScamReportCard__category-section p").Text()
+		Name := e.Find(".create-ScamReportCard__preview-description-wrapper").Text()
+		Address := e.Find(".create-ReportedSection__address-section .create-ResponsiveAddress__text").Text()
+		Domain := e.Find(".create-ReportedSection__domain").Text()
+		Timestamp := e.Find(".create-ScamReportCard__submitted-info > span:nth-child(3)").Text()
+
+		// Handle type from img alt text
 		imgAlt := ""
-		e.DOM.Find(".create-ReportedSection__address-section img").Each(func(_ int, img *goquery.Selection) {
+		e.Find(".create-ReportedSection__address-section img").Each(func(_ int, img *goquery.Selection) {
 			altText, exists := img.Attr("alt")
 			if exists {
 				imgAlt = altText
@@ -158,9 +144,9 @@ func createReports() {
 		})
 
 		if imgAlt != "" {
-			words := strings.Fields(imgAlt) // Split the string into words
+			words := strings.Fields(imgAlt)
 			if len(words) > 0 {
-				imgAlt = words[0] // Get the first word
+				imgAlt = words[0]
 			}
 		}
 
@@ -175,6 +161,28 @@ func createReports() {
 		date := t.Format("2006-01-02")
 		Timestamp = t.Format("15:04:05")
 
+		// Check if the report already exists in the database
+		var exists bool
+		err = db.QueryRow(`
+			SELECT EXISTS(
+				SELECT 1 FROM reports
+				WHERE category = $1
+				AND name = $2
+				AND address = $3
+				AND type = $4
+				AND domain = $5
+			)`, Category, name, Address, imgAlt, Domain).Scan(&exists)
+
+		if err != nil {
+			fmt.Println("Error querying database:", err)
+			return
+		}
+
+		if exists {
+			fmt.Printf("Report with category %s and address %s already exists. Skipping insertion.\n", Category, Address)
+			return
+		}
+
 		report := item{
 			ID:        uuid.New(),
 			Category:  Category,
@@ -188,6 +196,24 @@ func createReports() {
 
 		reports = append(reports, report)
 
+		maxLength := 1024
+		if len(report.Category) > maxLength {
+    		report.Category = report.Category[:maxLength]
+		}
+		if len(report.Name) > maxLength {
+    		report.Name = report.Name[:maxLength]
+		}
+		if len(report.Address) > maxLength {
+    		report.Address = report.Address[:maxLength]
+		}
+		if len(report.Type) > maxLength {
+    		report.Type = report.Type[:maxLength]
+		}
+		if len(report.Domain) > maxLength {
+    		report.Domain = report.Domain[:maxLength]
+		}
+
+
 		// Insert into DB
 		_, err = db.Exec("INSERT INTO reports (id, category, name, address, type, domain, timestamp, date) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
 			report.ID, report.Category, report.Name, report.Address, report.Type, report.Domain, report.Timestamp, report.Date)
@@ -196,13 +222,40 @@ func createReports() {
 		}
 	})
 
-	// Visit the website for scraping
-	c.Visit("https://www.chainabuse.com/reports")
-
-	fmt.Println("Scraping job completed.")
+	fmt.Printf("Visited: %s\n", url)
 }
 
-// Fetch all reports from the DB
+func getTotalReports() (int, error) {
+	ctx, cancel := chromedp.NewContext(context.Background())
+	defer cancel()
+
+	var htmlContent string
+	err := chromedp.Run(ctx,
+		chromedp.Navigate("https://www.chainabuse.com/reports"),
+		chromedp.WaitVisible(".create-ResultsSection__results-title"),
+		chromedp.OuterHTML("html", &htmlContent),
+	)
+	if err != nil {
+		return 0, err
+	}
+
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader(htmlContent))
+	if err != nil {
+		return 0, err
+	}
+
+	var totalReports int
+	doc.Find(".create-ResultsSection__results-title").Each(func(i int, e *goquery.Selection) {
+		text := e.Text()
+		words := strings.Fields(text)
+		if len(words) > 0 {
+			totalReports, _ = strconv.Atoi(words[0])
+		}
+	})
+
+	return totalReports, nil
+}
+
 func getReports(w http.ResponseWriter, r *http.Request) {
 	rows, err := db.Query("SELECT id, category, name, address, type, domain, timestamp, date FROM reports")
 	if err != nil {
@@ -224,7 +277,6 @@ func getReports(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(reports)
 }
 
-// Fetch a single report by ID
 func getReportByID(w http.ResponseWriter, r *http.Request) {
 	params := mux.Vars(r)
 	id := params["id"]
@@ -241,7 +293,19 @@ func getReportByID(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(report)
 }
 
-// Utility functions to process time and name field
+// Utility functions
+
+func processNameField(s string) string {
+	trimmed := strings.TrimSpace(s)
+	var result []rune
+	for _, r := range trimmed {
+		if unicode.IsLetter(r) || unicode.IsSpace(r) {
+			result = append(result, r)
+		}
+	}
+	return string(result)
+}
+
 func parseTime(relativeTime string) string {
 	currentDate := time.Now()
 	fields := strings.Fields(relativeTime)
@@ -264,24 +328,4 @@ func parseTime(relativeTime string) string {
 	}
 
 	return currentDate.Format(time.RFC3339)
-}
-
-func processNameField(name string) string {
-	name = strings.TrimSpace(name)
-	if strings.Contains(name, "@") {
-		parts := strings.Split(name, "@")
-		if len(parts) > 1 {
-			afterAt := strings.Fields(parts[1])
-			if len(afterAt) > 0 {
-				return afterAt[0]
-			}
-		}
-	}
-	words := strings.FieldsFunc(name, func(c rune) bool {
-		return !unicode.IsLetter(c) && !unicode.IsDigit(c)
-	})
-	if len(words) == 1 {
-		return words[0]
-	}
-	return ""
 }
