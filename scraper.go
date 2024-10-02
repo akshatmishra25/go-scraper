@@ -38,9 +38,8 @@ func main() {
 	initDB()
 
 	// Start the background scraping job
-	go startScrapingJob()
+	go startScrapingJob() // concurrency
 
-	// Set up your HTTP router
 	router := mux.NewRouter()
 
 	router.HandleFunc("/reports", getReports).Methods("GET")
@@ -74,7 +73,7 @@ func initDB() {
 	}
 }
 
-// Start the background job to run scraping every 5 minutes
+// Start the background job to run scraping every 60 minutes
 func startScrapingJob() {
 	for {
 		fmt.Println("Starting scraping job...")
@@ -146,7 +145,7 @@ func scrapePage(url string) {
 		if imgAlt != "" {
 			words := strings.Fields(imgAlt)
 			if len(words) > 0 {
-				imgAlt = words[0]
+				imgAlt = words[0] // *Bitcoin* Logo
 			}
 		}
 
@@ -196,7 +195,7 @@ func scrapePage(url string) {
 
 		reports = append(reports, report)
 
-		maxLength := 1024
+		maxLength := 255
 		if len(report.Category) > maxLength {
     		report.Category = report.Category[:maxLength]
 		}
@@ -295,15 +294,24 @@ func getReportByID(w http.ResponseWriter, r *http.Request) {
 
 // Utility functions
 
-func processNameField(s string) string {
-	trimmed := strings.TrimSpace(s)
-	var result []rune
-	for _, r := range trimmed {
-		if unicode.IsLetter(r) || unicode.IsSpace(r) {
-			result = append(result, r)
+func processNameField(name string) string {
+	name = strings.TrimSpace(name)
+	if strings.Contains(name, "@") {
+		parts := strings.Split(name, "@")
+		if len(parts) > 1 {
+			afterAt := strings.Fields(parts[1])
+			if len(afterAt) > 0 {
+				return afterAt[0]
+			}
 		}
 	}
-	return string(result)
+	words := strings.FieldsFunc(name, func(c rune) bool {
+		return !unicode.IsLetter(c) && !unicode.IsDigit(c)
+	})
+	if len(words) == 1 {
+		return words[0]
+	}
+	return ""
 }
 
 func parseTime(relativeTime string) string {
